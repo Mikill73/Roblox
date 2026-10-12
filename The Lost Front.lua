@@ -19,8 +19,9 @@ local CONST = {
     DRONE_RESCAN_INTERVAL = 1.5,
     DRONE_REGISTER_DELAY = 0.35,
     MIN_ESP_BOX_SIZE = 2,
-    WEAPON_RESCAN_INTERVAL = 0.4,
     WEAPON_SCAN_INTERVAL = 0.1,
+    MINE_SCAN_INTERVAL = 0.1,
+    MINE_POLL_INTERVAL = 0.5,
 }
 
 if Environment.LostFrontDrawingESP and type(Environment.LostFrontDrawingESP.Unload) == "function" then
@@ -33,6 +34,8 @@ end
 
 local Repository = "https://raw.githubusercontent.com/Ali-lov3/Obsidian-UiLibs/refs/heads/main/"
 local Library = loadstring(game:HttpGet(Repository .. "Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet(Repository .. "addons/ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(Repository .. "addons/SaveManager.lua"))()
 local Options = Library.Options
 local Toggles = Library.Toggles
 
@@ -53,6 +56,10 @@ local Controller = {
     PlayerEntries = {},
     DroneEntries = {},
     WeaponEntries = {},
+    MineEntries = {},
+    MineStats = { detonated = 0, registered = 0, failed = 0 },
+    LastMineAction = "",
+    LastMineActionTime = 0,
     IgnoreSet = {},
     VisibilityCache = setmetatable({}, { __mode = "k" }),
     BoundsCache = setmetatable({}, { __mode = "k" }),
@@ -126,6 +133,23 @@ local Controller = {
         WeaponTeleportDelay = 0.06,
         WeaponHighlightColor = Color3.fromRGB(255, 220, 80),
 
+        -- SISTEMA DE MINAS
+        MinesEnabled = true,
+        MinesAutoTrigger = true,
+        MinesTriggerRadius = 25,
+        MinesTeamCheck = true,
+        MinesCooldown = 0.5,
+        MinesMaxActive = 5,
+        MinesShowESP = true,
+        MinesESPColor = Color3.fromRGB(255, 100, 60),
+        MinesESPText = true,
+        MinesFPVSlot = 1,
+        MinesAutoPlace = false,
+        MinesPlaceDistance = 6,
+        MinesKeyDetonateAll = "B",
+        MinesKeyPlace = "Z",
+        MinesKeyToggleMode = "N",
+
         -- Visuals
         BoxThickness = 1,
         TextSize = 13,
@@ -165,6 +189,11 @@ local function removeDrawing(object)
         if object.Remove then object:Remove()
         elseif object.Destroy then object:Destroy() end
     end)
+end
+
+local function setMineStatus(txt)
+    Controller.LastMineAction = txt
+    Controller.LastMineActionTime = os.clock()
 end
 
 local function rebuildIgnoreList()
@@ -359,7 +388,6 @@ end
 local function getBounds(model, camera)
     if not model or not camera then return nil end
     if not model:IsA("Model") then
-        -- BasePart solto: usa a própria part
         local sp, on = camera:WorldToViewportPoint(model.Position)
         if not on or sp.Z <= 0 then return nil end
         return Vector2.new(sp.X - 15, sp.Y - 15), Vector2.new(30, 30)
@@ -481,6 +509,18 @@ end
 local function isTeammate(player)
     local friendly = getPlayerTeamState(player)
     return friendly == true
+end
+
+local function isHostile(player)
+    if not player or player == LocalPlayer then return false end
+    local char = player.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root or hum.Health <= 0 then return false end
+    if not Controller.Settings.MinesTeamCheck then return true end
+    local state = getPlayerTeamState(player)
+    return state == false
 end
 
 -- =========================================================================
@@ -1352,7 +1392,6 @@ local function updateWeapons(camera, origin)
             end
         end
 
-        -- limpar entradas órfãs
         for item, _ in pairs(Controller.WeaponEntries) do
             if not item.Parent or not item:IsDescendantOf(folder) then
                 removeWeaponEntry(item)
@@ -1360,6 +1399,229 @@ local function updateWeapons(camera, origin)
         end
     end
 end
+
+-- =========================================================================
+-- SISTEMA DE MINAS
+-- =========================================================================
+local network = game.ReplicatedStorage:WaitForChild("network")
+local buildItem  = network:FindFirstChild("buildItem")
+local explodeRemote = network:FindFirstChild("explodeDrone")
+
+-- tenta achar o remote de input do drone (vários nomes)
+local droneInputRemote = nil
+do
+    for _, name in ipairs({
+        "droneInput", "droneControl", "controlDrone",
+        "drone", "controller", "input", "drone_input",
+        "control", "cmdDrone", "sendInput"
+    }) do
+        local r = network:FindFirstChild(name)
+        if r then
+            droneInputRemote = r
+            break
+        end
+    end
+end
+
+local function getPlaceables() return Workspace:FindFirstChild("placeables") end
+
+local function getDronePos(d)
+    local pp = d.PrimaryPart
+    if pp then return pp.Position end
+    local bp = d:FindFirstChildWhichIsA("BasePart", true)
+    return bp and bp.Position
+end
+
+local function isMyDrone(m)
+    if not m or not m:IsA("Model") then return false end
+    local o = m:GetAttribute("player")
+    if o then return tostring(o) == LocalPlayer.Name end
+    return m.Name:find(tostring(LocalPlayer.UserId), 1, true) ~= nil
+end
+
+local function getGroundCFrame()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local s = Controller.Settings
+    local origin = root.Position + root.CFrame.LookVector * s.MinesPlaceDistance + Vector3.new(0, 10, 0)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { char, Workspace:FindFirstChild("buildables") }
+    params.IgnoreWater = true
+    local hit = Workspace:Raycast(origin, Vector3.new(0, -50, 0), params)
+    if not hit or hit.Normal:Dot(Vector3.new(0,1,0)) < 0.93 then return nil end
+    local _, yaw = Workspace.CurrentCamera.CFrame:ToOrientation()
+    return CFrame.new(hit.Position) * CFrame.Angles(0, yaw, 0)
+end
+
+local function tryAutoPlace()
+    if not buildItem then
+        setMineStatus("❌ buildItem não existe")
+        return
+    end
+    local cf = getGroundCFrame()
+    if not cf then
+        setMineStatus("❌ Chão inválido")
+        Controller.MineStats.failed += 1
+        return
+    end
+    local ok, res, err = pcall(function() return buildItem:InvokeServer(Controller.Settings.MinesFPVSlot, cf) end)
+    if ok and res then
+        setMineStatus("✅ Plantado")
+    else
+        Controller.MineStats.failed += 1
+        setMineStatus("❌ " .. tostring(err or res or "erro"))
+    end
+end
+
+local function detonateMine(drone)
+    if not drone or not drone.Parent then return end
+
+    if droneInputRemote then
+        pcall(function() droneInputRemote:FireServer(drone.Name, "detonate") end)
+    end
+    if explodeRemote then
+        pcall(function() explodeRemote:FireServer(drone.Name) end)
+    end
+    -- fallback: procura qualquer remote com "explode" ou "detonat"
+    for _, c in ipairs(network:GetChildren()) do
+        if c:IsA("RemoteEvent") then
+            local n = c.Name:lower()
+            if n:find("explode") or n:find("detonat") then
+                pcall(function() c:FireServer(drone.Name) end)
+            end
+        end
+    end
+
+    Controller.MineEntries[drone] = nil
+    Controller.MineStats.detonated += 1
+    setMineStatus("💥 Detonou")
+end
+
+local function detonateAllMines()
+    local n = 0
+    for d in pairs(Controller.MineEntries) do
+        detonateMine(d)
+        n += 1
+    end
+    if n > 0 then setMineStatus("💥 Detonou " .. n) end
+end
+
+-- Cria visual (texto) pra cada mina
+local function createMineVisual(drone)
+    if not Controller.Settings.MinesShowESP then return nil end
+    return {
+        text = safeDrawing("Text", {
+            Visible = false, Center = true, Outline = true,
+            OutlineColor = Color3.new(0, 0, 0),
+            Color = Controller.Settings.MinesESPColor,
+            Size = 14,
+            Font = Drawing.Fonts and (Drawing.Fonts.Plex or Drawing.Fonts.UI) or 2,
+            Transparency = 1, ZIndex = 10,
+        })
+    }
+end
+
+local function removeMineVisual(v)
+    if v and v.text then removeDrawing(v.text) end
+end
+
+-- poll pra descobrir drones novos
+task.spawn(function()
+    while true do
+        if not Controller.Unloaded then
+            local folder = getPlaceables()
+            if folder then
+                for _, d in ipairs(folder:GetChildren()) do
+                    if isMyDrone(d) and not Controller.MineEntries[d] then
+                        local pos = getDronePos(d)
+                        if pos then
+                            local v = createMineVisual(d)
+                            Controller.MineEntries[d] = {
+                                pos = pos,
+                                plantedAt = os.clock(),
+                                lastDist = math.huge,
+                                visual = v,
+                            }
+                            Controller.MineStats.registered += 1
+                            setMineStatus("💣 Mina registrada")
+                        end
+                    end
+                end
+            end
+            -- limpa órfãos
+            for d, data in pairs(Controller.MineEntries) do
+                if not d.Parent then
+                    removeMineVisual(data.visual)
+                    Controller.MineEntries[d] = nil
+                end
+            end
+        end
+        task.wait(CONST.MINE_POLL_INTERVAL)
+    end
+end)
+
+-- loop de detecção + render das minas
+task.spawn(function()
+    while true do
+        if not Controller.Unloaded then
+            local s = Controller.Settings
+            local camera = Workspace.CurrentCamera
+            for drone, data in pairs(Controller.MineEntries) do
+                if not drone.Parent then
+                    removeMineVisual(data.visual)
+                    Controller.MineEntries[drone] = nil
+                else
+                    local pos = getDronePos(drone)
+                    if pos then
+                        data.pos = pos
+
+                        if s.MinesEnabled and s.MinesAutoTrigger then
+                            local cd = math.huge
+                            for _, p in ipairs(Players:GetPlayers()) do
+                                if isHostile(p) then
+                                    local c = p.Character
+                                    local r = c and c:FindFirstChild("HumanoidRootPart")
+                                    if r then
+                                        local d = (r.Position - pos).Magnitude
+                                        if d < cd then cd = d end
+                                        if d <= s.MinesTriggerRadius then
+                                            detonateMine(drone)
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                            data.lastDist = cd
+                        end
+
+                        -- render
+                        local v = data.visual
+                        if v and v.text and camera then
+                            if s.MinesShowESP and s.MinesESPText then
+                                local sp, on = camera:WorldToViewportPoint(pos)
+                                if on and sp.Z > 0 then
+                                    local myPos = getDistanceOrigin(camera)
+                                    local d = (pos - myPos).Magnitude
+                                    v.text.Text = string.format("💣 [%dm]", math.floor(d + 0.5))
+                                    v.text.Position = Vector2.new(sp.X, sp.Y - 20)
+                                    v.text.Color = s.MinesESPColor
+                                    v.text.Visible = true
+                                else
+                                    v.text.Visible = false
+                                end
+                            else
+                                v.text.Visible = false
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(CONST.MINE_SCAN_INTERVAL)
+    end
+end)
 
 -- =========================================================================
 -- WATERMARK UPDATE
@@ -1383,9 +1645,8 @@ local function updateWatermark(dt)
     end
     local tlabel = Controller.LastSilentTarget ~= "" and (" | Target: " .. Controller.LastSilentTarget) or ""
     Watermark.Text = string.format(
-        "The Lost Front | FPS: %d | Silent: %d | Redirects: %d | Itens: %d%s",
-        FPS_Value, Controller.FastCastCalls, Controller.SilentRedirects,
-        WeaponState.collected, tlabel
+        "Lost Front | FPS: %d | Silent: %d | Mines: %d%s",
+        FPS_Value, Controller.SilentRedirects, Controller.MineStats.detonated, tlabel
     )
     Watermark.Visible = true
 end
@@ -1416,6 +1677,8 @@ local function cleanup()
     for player, v in pairs(Controller.PlayerEntries) do removeVisual(v); Controller.PlayerEntries[player] = nil end
     for model, v in pairs(Controller.DroneEntries) do removeVisual(v); Controller.DroneEntries[model] = nil end
     for item, _ in pairs(Controller.WeaponEntries) do removeWeaponEntry(item) end
+    for drone, data in pairs(Controller.MineEntries) do removeMineVisual(data.visual) end
+    table.clear(Controller.MineEntries)
 
     for _, player in ipairs(Players:GetPlayers()) do
         local c = player.Character
@@ -1475,7 +1738,7 @@ local Window = Library:CreateWindow({
     AutoShow = true,
     Center = true,
     Resizable = true,
-    Size = UDim2.fromOffset(600, 500),
+    Size = UDim2.fromOffset(620, 520),
     ToggleKeybind = Enum.KeyCode.F1
 })
 
@@ -1485,6 +1748,7 @@ local Tabs = {}
 Tabs.SilentAim = Window:AddTab("Silent Aim", "crosshair", "")
 Tabs.ESP = Window:AddTab("ESP", "scan-eye", "")
 Tabs.Itens = Window:AddTab("Itens", "package", "")
+Tabs.Minas = Window:AddTab("Minas", "bomb", "")
 Tabs.Settings = Window:AddTab("UI Settings", "settings", "")
 
 -- =========================================================================
@@ -1704,7 +1968,7 @@ VisualGroup:AddToggle("WatermarkEnabled", {
 })
 
 -- =========================================================================
--- ABA ITENS (armas)
+-- ABA ITENS
 -- =========================================================================
 local WeaponESPToggleGroup = Tabs.Itens:AddLeftGroupbox("ESP de Itens", "scan-eye")
 local WeaponCollectGroup = Tabs.Itens:AddRightGroupbox("Auto-Collect", "package-open")
@@ -1762,6 +2026,84 @@ WeaponVisualGroup:AddLabel("Cor do item"):AddColorPicker("WeaponHighlightColor",
 })
 
 -- =========================================================================
+-- ABA MINAS
+-- =========================================================================
+local MineMainGroup = Tabs.Minas:AddLeftGroupbox("Sistema de Minas", "bomb")
+local MineConfigGroup = Tabs.Minas:AddRightGroupbox("Configurações", "settings")
+local MineInfoGroup = Tabs.Minas:AddLeftGroupbox("Info & Teclas", "keyboard")
+
+MineMainGroup:AddToggle("MinesEnabled", {
+    Text = "Ativado", Default = true,
+    Callback = function(v) Controller.Settings.MinesEnabled = v end
+})
+MineMainGroup:AddToggle("MinesAutoTrigger", {
+    Text = "Detonar automático (inimigo perto)", Default = true,
+    Callback = function(v) Controller.Settings.MinesAutoTrigger = v end
+})
+MineMainGroup:AddSlider("MinesTriggerRadius", {
+    Text = "Raio de detecção", Default = 25, Min = 5, Max = 100, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Controller.Settings.MinesTriggerRadius = v end
+})
+MineMainGroup:AddToggle("MinesTeamCheck", {
+    Text = "Team check", Default = true,
+    Callback = function(v) Controller.Settings.MinesTeamCheck = v end
+})
+MineMainGroup:AddToggle("MinesAutoPlace", {
+    Text = "Auto-place (planta sozinho)", Default = false,
+    Callback = function(v) Controller.Settings.MinesAutoPlace = v end
+})
+MineMainGroup:AddButton({
+    Text = "💥 DETONAR TODAS AGORA",
+    Func = detonateAllMines
+})
+
+MineConfigGroup:AddSlider("MinesCooldown", {
+    Text = "Cooldown por drone", Default = 50, Min = 10, Max = 300, Rounding = 0, Suffix = " (x10ms)",
+    Callback = function(v) Controller.Settings.MinesCooldown = v / 100 end
+})
+MineConfigGroup:AddSlider("MinesMaxActive", {
+    Text = "Máximo de minas ativas", Default = 5, Min = 1, Max = 15, Rounding = 0,
+    Callback = function(v) Controller.Settings.MinesMaxActive = v end
+})
+MineConfigGroup:AddSlider("MinesFPVSlot", {
+    Text = "Slot do FPV (hotbar)", Default = 1, Min = 1, Max = 9, Rounding = 0,
+    Callback = function(v) Controller.Settings.MinesFPVSlot = v end
+})
+MineConfigGroup:AddSlider("MinesPlaceDistance", {
+    Text = "Distância à frente (auto-place)", Default = 6, Min = 3, Max = 15, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Controller.Settings.MinesPlaceDistance = v end
+})
+MineConfigGroup:AddToggle("MinesShowESP", {
+    Text = "Mostrar ESP das minas", Default = true,
+    Callback = function(v) Controller.Settings.MinesShowESP = v end
+})
+MineConfigGroup:AddToggle("MinesESPText", {
+    Text = "Texto da mina (nome + dist)", Default = true,
+    Callback = function(v) Controller.Settings.MinesESPText = v end
+})
+MineConfigGroup:AddLabel("Cor do ESP"):AddColorPicker("MinesESPColor", {
+    Default = Controller.Settings.MinesESPColor, Title = "Cor do ESP",
+    Callback = function(v) Controller.Settings.MinesESPColor = v end
+})
+
+MineInfoGroup:AddLabel("Tecla — Detonar todas"):AddKeyPicker("MinesKeyDetonateAll", {
+    Default = "B", Text = "Detonar todas", NoUI = false,
+    Callback = function(v)
+        Controller.Settings.MinesKeyDetonateAll = v
+    end
+})
+MineInfoGroup:AddLabel("Tecla — Plantar (auto)"):AddKeyPicker("MinesKeyPlace", {
+    Default = "Z", Text = "Plantar",
+    Callback = function(v)
+        Controller.Settings.MinesKeyPlace = v
+    end
+})
+MineInfoGroup:AddLabel("Status:"):AddLabel("Status inicial", true)
+
+-- label dinâmico (atualizado no loop)
+local StatusLabel = MineInfoGroup:AddLabel("Aguardando...", true)
+
+-- =========================================================================
 -- ABA UI SETTINGS
 -- =========================================================================
 local MenuGroup = Tabs.Settings:AddLeftGroupbox("Menu", "wrench")
@@ -1773,7 +2115,7 @@ MenuGroup:AddDropdown("DPIScale", {
         Library:SetDPIScale(tonumber(value:gsub("%%", "")))
     end
 })
-MenuGroup:AddLabel("Menu keybind (F1)"):AddKeyPicker("MenuKeybind", {
+MenuGroup:AddLabel("Menu keybind"):AddKeyPicker("MenuKeybind", {
     Default = "F1", NoUI = true, Text = "Menu keybind"
 })
 MenuGroup:AddLabel("The built-in mobile menu button is enabled.", true)
@@ -1781,6 +2123,18 @@ MenuGroup:AddButton({ Text = "Unload", Func = Controller.Unload })
 
 Library.ToggleKeybind = Options.MenuKeybind
 Library:OnUnload(cleanup)
+
+-- =========================================================================
+-- THEME + SAVE MANAGER (de volta)
+-- =========================================================================
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+ThemeManager:SetFolder("LostFrontESP")
+SaveManager:SetFolder("LostFrontESP")
+SaveManager:BuildConfigSection(Tabs.Settings)
+ThemeManager:ApplyToTab(Tabs.Settings)
 
 -- =========================================================================
 -- CONNECTIONS
@@ -1795,6 +2149,32 @@ addConnection(Workspace.DescendantAdded:Connect(function(descendant)
     end
 end))
 
+-- detecta keybind pickers quando mudam
+addConnection(UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    local s = Controller.Settings
+
+    -- detonar todas
+    if Options.MinesKeyDetonateAll and Options.MinesKeyDetonateAll.Value then
+        local keyStr = Options.MinesKeyDetonateAll.Value
+        if keyStr and keyStr ~= "None" and input.KeyCode == Enum.KeyCode[keyStr] then
+            detonateAllMines()
+        end
+    end
+
+    -- plantar (auto-place)
+    if Options.MinesKeyPlace and Options.MinesKeyPlace.Value then
+        local keyStr = Options.MinesKeyPlace.Value
+        if keyStr and keyStr ~= "None" and input.KeyCode == Enum.KeyCode[keyStr] then
+            if s.MinesAutoPlace then
+                tryAutoPlace()
+            else
+                setMineStatus("👀 Modo manual — plante no jogo")
+            end
+        end
+    end
+end))
+
 local LastESPUpdate = 0
 local LastWeaponScan = 0
 local LastWeaponESPUpdate = 0
@@ -1805,8 +2185,6 @@ addConnection(RunService.RenderStepped:Connect(function(dt)
     if not camera then return end
 
     updateSilentAimTarget(camera)
-
-    local now = os.clock()
 
     -- ESP (players/drones) a ~30 Hz
     LastESPUpdate = LastESPUpdate + dt
@@ -1842,13 +2220,35 @@ task.spawn(function()
     end
 end)
 
+-- atualiza o label de status das minas
+task.spawn(function()
+    while not Controller.Unloaded do
+        if StatusLabel and StatusLabel.SetText then
+            local s = Controller.Settings
+            local mode = s.MinesAutoPlace and "AUTO" or "MANUAL"
+            local txt = string.format("[%s] %s", mode, Controller.LastMineAction or "Pronto")
+            pcall(function() StatusLabel:SetText(txt) end)
+        end
+        task.wait(0.5)
+    end
+end)
+
 -- =========================================================================
 -- INIT
 -- =========================================================================
 rebuildIgnoreList()
+
+-- carrega config salva (autoload)
+pcall(function() SaveManager:LoadAutoloadConfig() end)
 
 if Toggles.SilentAimEnabled then
     Toggles.SilentAimEnabled:SetValue(true)
 else
     Controller.Settings.SilentAimEnabled = true
 end
+
+print("[LostFront] Script carregado.")
+print("[LostFront] Remotes:")
+print("  buildItem:", buildItem and buildItem.ClassName or "nil")
+print("  explodeDrone:", explodeRemote and explodeRemote.ClassName or "nil")
+print("  droneInput:", droneInputRemote and droneInputRemote.Name or "NÃO ENCONTRADO")
