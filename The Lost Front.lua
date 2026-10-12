@@ -19,7 +19,12 @@ local CONST = {
     WEAPON_SCAN_INTERVAL = 0.1,
     MINE_POLL_INTERVAL = 0.4,
     MINE_CHECK_INTERVAL = 0.1,
-    MINE_ACTIVATE_DELAY = 0.08,
+    MINE_ACTIVATE_DELAY_MIN = 0.15,
+    MINE_ACTIVATE_DELAY_MAX = 0.35,
+    MINE_REACTION_MIN = 0.25,
+    MINE_REACTION_MAX = 0.55,
+    MINE_MIN_GAP = 1.2,
+    MINE_MAX_PER_MIN = 3,
 }
 
 if Environment.LostFrontDrawingESP and type(Environment.LostFrontDrawingESP.Unload) == "function" then
@@ -83,17 +88,19 @@ local Controller = {
         WeaponTeleportOffset = Vector3.new(0, 2.5, 0), WeaponTeleportDelay = 0.06,
         WeaponHighlightColor = Color3.fromRGB(255, 220, 80),
 
-        -- MINAS
+        -- MINAS (novo padrão anti-ban)
         MineEnabled = true,
         MineHighlight = true,
         MineAlert = true,
-        MineAutoDetonate = false,          -- auto-detonar quando inimigo perto
-        MineAutoDetonateDelay = 0,         -- delay extra antes de auto-detonar (segundos)
-        MineAlertRadius = 30,              -- raio de detecção de inimigo
+        MineAutoDetonate = false,             -- DESLIGADO por padrão
+        MineAlertRadius = 20,                 -- raio pra ALERTAR (só visual)
+        MineContactRadius = 3,                -- distância pra DETONAR (por contato)
         MineBKeyEnabled = true,
         MineHighlightColor = Color3.fromRGB(255, 100, 100),
-        MinePlayerSafeDistance = 40,       -- distância MÍNIMA de você até o drone pra poder explodir
-        MineMaxDistanceFromPlayer = 600,   -- distância MÁXIMA (sinal do controller)
+        MinePlayerSafeDistance = 40,
+        MineMaxDistanceFromPlayer = 600,
+        MineWallCheck = true,                 -- proteção extra (mesmo em contato)
+        MineWallCheckMaxDist = 20,
 
         BoxThickness = 1, TextSize = 13, Opacity = 1, WatermarkEnabled = true,
     }
@@ -822,10 +829,12 @@ local function updateWeapons(cam, origin)
 end
 
 -- =========================================================================
--- MINAS — ativação via createDrone + explodeDrone + auto-detonate
+-- MINAS — detonação por contato + anti-ban
 -- =========================================================================
 local Mines = {}
 local MineStats = { detonated = 0, planted = 0, activated = 0, failed = 0 }
+local DetonateHistory = {}
+
 local network = game.ReplicatedStorage:FindFirstChild("network")
 local createDrone = network and network:FindFirstChild("createDrone")
 local explodeDrone = network and network:FindFirstChild("explodeDrone")
@@ -845,6 +854,63 @@ end
 local function getMyRoot()
     local c = LocalPlayer.Character
     return c and (c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart)
+end
+
+-- distância mínima entre um ponto e um modelo (usa bounding box)
+local function distanceToModel(point, model)
+    if not model or not model.Parent then return math.huge end
+    local ok, cf, sz = pcall(model.GetBoundingBox, model)
+    if ok and sz.Magnitude > 0 then
+        -- aproximação: distância do ponto ao centro menos metade da diagonal
+        local center = cf.Position
+        local radius = sz.Magnitude * 0.5
+        local d = (point - center).Magnitude
+        return math.max(0, d - radius)
+    end
+    -- fallback: usa primary part
+    local anchor = getMineAnchor(model)
+    if anchor then return (point - anchor.Position).Magnitude end
+    return math.huge
+end
+
+-- checa se tem linha de visão livre entre dois pontos
+local function hasLineOfSight(fromPos, toPos, extraExclusions)
+    if not Controller.Settings.MineWallCheck then return true end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+    local exclude = {}
+    if LocalPlayer.Character then table.insert(exclude, LocalPlayer.Character) end
+    local placeables = getPlaceables()
+    if placeables then table.insert(exclude, placeables) end
+    local buildables = Workspace:FindFirstChild("buildables")
+    if buildables then table.insert(exclude, buildables) end
+    if extraExclusions then
+        for _, inst in ipairs(extraExclusions) do
+            if inst then table.insert(exclude, inst) end
+        end
+    end
+    params.FilterDescendantsInstances = exclude
+    local result = Workspace:Raycast(fromPos, toPos - fromPos, params)
+    return result == nil
+end
+
+-- rate limit
+local function canDetonateNow()
+    local now = os.clock()
+    for i = #DetonateHistory, 1, -1 do
+        if now - DetonateHistory[i] > 60 then table.remove(DetonateHistory, i) end
+    end
+    if #DetonateHistory >= CONST.MINE_MAX_PER_MIN then
+        return false, "limite/min (" .. CONST.MINE_MAX_PER_MIN .. "/min)"
+    end
+    if #DetonateHistory > 0 then
+        local last = DetonateHistory[#DetonateHistory]
+        if now - last < CONST.MINE_MIN_GAP then
+            return false, string.format("gap %.1fs", CONST.MINE_MIN_GAP - (now - last))
+        end
+    end
+    return true
 end
 
 local function createMineVisual(mine)
@@ -871,64 +937,77 @@ local function removeMine(mine)
     removeMineVisual(e.visual); Mines[mine] = nil
 end
 
--- Detona com ativação correta: createDrone → explodeDrone
+-- DETONAÇÃO ANTI-BAN
 local function detonateMine(mine, source)
     if not mine or not mine.Parent then return false end
     if not createDrone or not explodeDrone then
-        warn("[Mine] createDrone ou explodeDrone não existe")
         MineStats.failed = MineStats.failed + 1
         return false
     end
 
-    -- 1) ATIVA via createDrone
-    local ok1 = pcall(function()
-        createDrone:InvokeServer(mine.Name)
-    end)
-    if ok1 then MineStats.activated = MineStats.activated + 1 end
+    -- 1) rate limit
+    local ok, reason = canDetonateNow()
+    if not ok then
+        return false
+    end
 
-    -- 2) delay pro servidor registrar
-    task.wait(CONST.MINE_ACTIVATE_DELAY)
+    -- 2) reação humana (delay aleatório)
+    local reaction = CONST.MINE_REACTION_MIN
+        + math.random() * (CONST.MINE_REACTION_MAX - CONST.MINE_REACTION_MIN)
+    task.wait(reaction)
 
-    -- 3) verifica se ainda existe
+    if not mine.Parent then return false end
+
+    -- 3) ativa
+    pcall(function() createDrone:InvokeServer(mine.Name) end)
+    MineStats.activated = MineStats.activated + 1
+
+    -- 4) delay aleatório entre ativar e explodir
+    local act = CONST.MINE_ACTIVATE_DELAY_MIN
+        + math.random() * (CONST.MINE_ACTIVATE_DELAY_MAX - CONST.MINE_ACTIVATE_DELAY_MIN)
+    task.wait(act)
+
     if not mine.Parent then
-        -- já explodiu só com ativação (raro)
         MineStats.detonated = MineStats.detonated + 1
+        table.insert(DetonateHistory, os.clock())
         removeMine(mine)
         return true
     end
 
-    -- 4) EXPLODE
-    pcall(function()
-        explodeDrone:FireServer(mine.Name)
-    end)
+    -- 5) explode
+    pcall(function() explodeDrone:FireServer(mine.Name) end)
 
     MineStats.detonated = MineStats.detonated + 1
+    table.insert(DetonateHistory, os.clock())
     removeMine(mine)
-    if source then
-        print(string.format("[Mine] Detonou %s (via %s)", mine.Name:match("[^%-]+$") or mine.Name, source))
-    end
     return true
 end
 
--- Checa se pode detonar: precisa inimigo perto + você longe do drone
+-- checa se pode detonar (contato + safety + LOS)
 local function canDetonate(mine, entry)
     local s = Controller.Settings
 
-    -- 1) Inimigo próximo?
-    local enemyNear = entry.lastEnemyDist and entry.lastEnemyDist <= s.MineAlertRadius
-    if not enemyNear then return false, "sem inimigo" end
+    -- CONTATO: inimigo dentro do raio de contato
+    if not entry.lastEnemyDist or entry.lastEnemyDist > s.MineContactRadius then
+        return false, "sem contato"
+    end
 
-    -- 2) Você longe o suficiente do drone? (safety)
+    -- inimigo visível (LOS)
+    if not entry.lastEnemyVisible then
+        return false, "sem LOS"
+    end
+
+    -- safety: você longe do drone
     local root = getMyRoot()
     if root then
         local anchor = getMineAnchor(mine)
         if anchor then
             local myDist = (root.Position - anchor.Position).Magnitude
             if myDist < s.MinePlayerSafeDistance then
-                return false, string.format("você está a %.0f studs (mín %d)", myDist, s.MinePlayerSafeDistance)
+                return false, string.format("perto de você (%.0f)", myDist)
             end
             if myDist > s.MineMaxDistanceFromPlayer then
-                return false, string.format("fora de alcance (%.0f)", myDist)
+                return false, string.format("longe demais (%.0f)", myDist)
             end
         end
     end
@@ -1011,9 +1090,10 @@ task.spawn(function()
                         Mines[m] = {
                             visual = createMineVisual(m),
                             plantedAt = os.clock(),
-                            lastEnemyDist = math.huge,
                             lastEnemy = nil,
-                            autoArmed = false,  -- auto-detonate pronto?
+                            lastEnemyDist = math.huge,
+                            lastEnemyVisible = false,
+                            enemyContactSince = nil,
                         }
                         MineStats.planted = MineStats.planted + 1
                     end
@@ -1025,7 +1105,7 @@ task.spawn(function()
     end
 end)
 
--- CHECK de inimigo + auto-detonate
+-- CHECK de inimigo + auto-detonate (por contato)
 task.spawn(function()
     while true do
         if not Controller.Unloaded then
@@ -1033,40 +1113,57 @@ task.spawn(function()
                 if mine.Parent then
                     local a = getMineAnchor(mine)
                     if a then
-                        -- acha inimigo mais próximo
                         local closest, closestD = nil, math.huge
+                        local closestVisible = false
+
                         for _, p in ipairs(Players:GetPlayers()) do
                             if p ~= LocalPlayer then
                                 local isEnemy = true
-                                if Controller.Settings.SilentAimTeamCheck then isEnemy = not isTeammate(p) end
+                                if Controller.Settings.SilentAimTeamCheck then
+                                    isEnemy = not isTeammate(p)
+                                end
                                 if isEnemy then
                                     local c = p.Character
                                     local r = c and c:FindFirstChild("HumanoidRootPart")
                                     local h = c and c:FindFirstChildOfClass("Humanoid")
                                     if r and h and h.Health > 0 then
-                                        local d = (r.Position - a.Position).Magnitude
-                                        if d < closestD then closest, closestD = p, d end
+                                        -- distância até o drone (contato por bounding box)
+                                        local d = distanceToModel(r.Position, mine)
+                                        if d < closestD then
+                                            -- LOS check (com exclusão do inimigo)
+                                            local visible = hasLineOfSight(a.Position, r.Position, { c })
+                                            closest, closestD = p, d
+                                            closestVisible = visible
+                                        end
                                     end
                                 end
                             end
                         end
-                        entry.lastEnemyDist = closestD
-                        entry.lastEnemy = closest
 
-                        -- AUTO-DETONATE
+                        entry.lastEnemy = closest
+                        entry.lastEnemyDist = closestD
+                        entry.lastEnemyVisible = closestVisible
+
+                        -- AUTO-DETONATE por contato
                         if Controller.Settings.MineAutoDetonate and closest then
-                            local ok, reason = canDetonate(mine, entry)
+                            local ok = canDetonate(mine, entry)
                             if ok then
-                                if Controller.Settings.MineAutoDetonateDelay > 0 then
-                                    task.wait(Controller.Settings.MineAutoDetonateDelay)
+                                if not entry.enemyContactSince then
+                                    entry.enemyContactSince = os.clock()
                                 end
-                                task.spawn(function()
-                                    detonateMine(mine, "auto")
-                                end)
-                                break  -- evita iterar mais nesse loop
+                                -- reação humana: inimigo precisa estar em contato por 0.5-1s
+                                local contactDur = os.clock() - entry.enemyContactSince
+                                local required = 0.5 + math.random() * 0.5
+                                if contactDur >= required then
+                                    task.spawn(function() detonateMine(mine, "auto") end)
+                                    entry.enemyContactSince = nil
+                                    break
+                                end
                             else
-                                entry.lastBlockReason = reason
+                                entry.enemyContactSince = nil
                             end
+                        else
+                            entry.enemyContactSince = nil
                         end
                     end
                 end
@@ -1092,9 +1189,16 @@ addConnection(RunService.RenderStepped:Connect(function(dt)
     if Controller.Settings.MineEnabled then
         for mine, entry in pairs(Mines) do
             if mine.Parent and entry.visual and entry.visual.highlight then
-                local enemyNear = entry.lastEnemyDist and entry.lastEnemyDist <= Controller.Settings.MineAlertRadius
+                local near = entry.lastEnemyDist and entry.lastEnemyDist <= Controller.Settings.MineAlertRadius
+                local contact = entry.lastEnemyDist and entry.lastEnemyDist <= Controller.Settings.MineContactRadius
                 entry.visual.highlight.Enabled = Controller.Settings.MineHighlight
-                entry.visual.highlight.FillColor = enemyNear and Color3.fromRGB(255, 60, 60) or Controller.Settings.MineHighlightColor
+                if contact then
+                    entry.visual.highlight.FillColor = Color3.fromRGB(255, 30, 30)
+                elseif near then
+                    entry.visual.highlight.FillColor = Color3.fromRGB(255, 150, 60)
+                else
+                    entry.visual.highlight.FillColor = Controller.Settings.MineHighlightColor
+                end
             end
         end
     end
@@ -1140,22 +1244,28 @@ task.spawn(function()
     while not Controller.Unloaded do discoverDrones(); task.wait(CONST.DRONE_RESCAN_INTERVAL) end
 end)
 
--- [B] detona todas (com ativação correta)
+-- [B] detona a mina mais próxima DE VOCÊ (uma por vez)
 UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.B and Controller.Settings.MineBKeyEnabled then
         task.spawn(function()
-            local snapshot = {}
-            for mine in pairs(Mines) do table.insert(snapshot, mine) end
-            local n = 0
-            for _, mine in ipairs(snapshot) do
+            local root = getMyRoot()
+            if not root then return end
+            local best, bd = nil, math.huge
+            for mine in pairs(Mines) do
                 if mine.Parent then
-                    detonateMine(mine, "B")
-                    n = n + 1
-                    task.wait(0.12)   -- espaçamento entre detonações
+                    local a = getMineAnchor(mine)
+                    if a then
+                        local d = (a.Position - root.Position).Magnitude
+                        if d < bd then best, bd = mine, d end
+                    end
                 end
             end
-            print("[Mine] [B] detonou " .. n .. " minas")
+            if best then
+                detonateMine(best, "B")
+            else
+                print("[Mine] Nenhuma mina ativa")
+            end
         end)
     end
 end)
@@ -1310,7 +1420,7 @@ WeaponColorGroup:AddLabel("Cor do item"):AddColorPicker("WeaponHighlightColor", 
 
 -- ABA MINAS
 local MineMainGroup = Tabs.Minas:AddLeftGroupbox("Minas", "bomb")
-local MineAutoGroup = Tabs.Minas:AddRightGroupbox("Auto-Detonate", "zap")
+local MineAutoGroup = Tabs.Minas:AddRightGroupbox("Auto-Detonate (contato)", "zap")
 local MineVisualGroup = Tabs.Minas:AddLeftGroupbox("Visual", "palette")
 
 MineMainGroup:AddToggle("MineEnabled", { Text = "Ativar sistema", Default = true,
@@ -1322,42 +1432,40 @@ MineMainGroup:AddToggle("MineHighlight", { Text = "Highlight nas minas", Default
     end })
 MineMainGroup:AddToggle("MineAlert", { Text = "Alerta 'INIMIGO NA MINA'", Default = true,
     Callback = function(v) Controller.Settings.MineAlert = v end })
-MineMainGroup:AddSlider("MineAlertRadius", { Text = "Raio de alerta (inimigo)", Default = 30, Min = 5, Max = 100, Rounding = 0, Suffix = " studs",
+MineMainGroup:AddSlider("MineAlertRadius", { Text = "Raio de ALERTA (visual)", Default = 20, Min = 5, Max = 100, Rounding = 0, Suffix = " studs",
     Callback = function(v) Controller.Settings.MineAlertRadius = v end })
+MineMainGroup:AddSlider("MineContactRadius", { Text = "Raio de CONTATO (detona)", Default = 3, Min = 1, Max = 15, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Controller.Settings.MineContactRadius = v end })
 
+MineAutoGroup:AddLabel("⚠️ Auto-detonate aumenta risco de ban. Use moderadamente.", true)
 MineAutoGroup:AddToggle("MineAutoDetonate", {
-    Text = "Auto-Detonar quando inimigo perto", Default = false,
+    Text = "Auto-Detonar em CONTATO", Default = false,
     Callback = function(v) Controller.Settings.MineAutoDetonate = v end })
-MineAutoGroup:AddSlider("MineAutoDetonateDelay", {
-    Text = "Delay antes de auto-detonar", Default = 0, Min = 0, Max = 300, Rounding = 0, Suffix = " (x10ms)",
-    Callback = function(v) Controller.Settings.MineAutoDetonateDelay = v / 100 end })
+MineAutoGroup:AddToggle("MineWallCheck", {
+    Text = "🧱 Wall check (precisa ver o inimigo)", Default = true,
+    Callback = function(v) Controller.Settings.MineWallCheck = v end })
 MineAutoGroup:AddSlider("MinePlayerSafeDistance", {
     Text = "Distância MÍN de você (safety)", Default = 40, Min = 0, Max = 200, Rounding = 0, Suffix = " studs",
     Callback = function(v) Controller.Settings.MinePlayerSafeDistance = v end })
 MineAutoGroup:AddSlider("MineMaxDistanceFromPlayer", {
     Text = "Distância MÁX de você (sinal)", Default = 600, Min = 100, Max = 1000, Rounding = 0, Suffix = " studs",
     Callback = function(v) Controller.Settings.MineMaxDistanceFromPlayer = v end })
-MineAutoGroup:AddToggle("MineBKeyEnabled", { Text = "Tecla [B] detona todas", Default = true,
-    Callback = function(v) Controller.Settings.MineBKeyEnabled = v end })
-MineAutoGroup:AddButton({ Text = "Detonar TODAS agora", Func = function()
+MineAutoGroup:AddToggle("MineBKeyEnabled", {
+    Text = "🔑 Tecla [B] detona a mais próxima", Default = true,
+    Callback = function(v)
+        Controller.Settings.MineBKeyEnabled = v
+        print("[Mine] Tecla [B]: " .. (v and "ATIVADA" or "DESATIVADA"))
+    end })
+MineAutoGroup:AddButton({ Text = "Detonar a mais próxima de mim", Func = function()
     task.spawn(function()
-        local snapshot = {}
-        for mine in pairs(Mines) do table.insert(snapshot, mine) end
-        local n = 0
-        for _, mine in ipairs(snapshot) do
-            if mine.Parent then detonateMine(mine, "manual"); n = n + 1; task.wait(0.12) end
+        local root = getMyRoot(); if not root then return end
+        local best, bd = nil, math.huge
+        for mine in pairs(Mines) do
+            local a = getMineAnchor(mine)
+            if a then local d = (a.Position - root.Position).Magnitude; if d < bd then best, bd = mine, d end end
         end
-        print("[Mine] Detonou " .. n)
+        if best then detonateMine(best, "manual") end
     end)
-end })
-MineAutoGroup:AddButton({ Text = "Detonar a mais próxima", Func = function()
-    local root = getMyRoot(); if not root then return end
-    local best, bd = nil, math.huge
-    for mine in pairs(Mines) do
-        local a = getMineAnchor(mine)
-        if a then local d = (a.Position - root.Position).Magnitude; if d < bd then best, bd = mine, d end end
-    end
-    if best then detonateMine(best, "manual") end
 end })
 
 MineVisualGroup:AddLabel("Cor do highlight"):AddColorPicker("MineHighlightColor", { Default = Controller.Settings.MineHighlightColor,
@@ -1396,4 +1504,5 @@ pcall(function() SaveManager:LoadAutoloadConfig() end)
 if Toggles.SilentAimEnabled then Toggles.SilentAimEnabled:SetValue(true) end
 
 print("[The Lost Front] Carregado. Menu: [F1] | Minas: [B]")
-print("  Detona via: createDrone:InvokeServer(nome) -> explodeDrone:FireServer(nome)")
+print("  Detona por CONTATO (default 3 studs) + wallcheck ON")
+print("  Limite:", CONST.MINE_MAX_PER_MIN, "detonações/minuto")
